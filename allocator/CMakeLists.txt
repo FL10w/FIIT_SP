@@ -1,3 +1,4 @@
+add_subdirectory(common)
 add_subdirectory(allocator)
 add_subdirectory(allocator_boundary_tags)
 add_subdirectory(allocator_buddies_system)

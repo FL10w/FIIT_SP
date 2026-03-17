@@ -1,0 +1,5 @@
+if(EXISTS "/home/flow/Documents/vsc/FIIT_SP/allocator/build2/allocator_sorted_list/tests/sys_prog_allctr_allctr_srtd_lst_tests[1]_tests.cmake")
+  include("/home/flow/Documents/vsc/FIIT_SP/allocator/build2/allocator_sorted_list/tests/sys_prog_allctr_allctr_srtd_lst_tests[1]_tests.cmake")
+else()
+  add_test(sys_prog_allctr_allctr_srtd_lst_tests_NOT_BUILT sys_prog_allctr_allctr_srtd_lst_tests_NOT_BUILT)
+endif()

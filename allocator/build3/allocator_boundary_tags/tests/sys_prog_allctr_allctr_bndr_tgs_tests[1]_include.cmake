@@ -1,0 +1,5 @@
+if(EXISTS "/home/flow/Documents/vsc/FIIT_SP/allocator/build3/allocator_boundary_tags/tests/sys_prog_allctr_allctr_bndr_tgs_tests[1]_tests.cmake")
+  include("/home/flow/Documents/vsc/FIIT_SP/allocator/build3/allocator_boundary_tags/tests/sys_prog_allctr_allctr_bndr_tgs_tests[1]_tests.cmake")
+else()
+  add_test(sys_prog_allctr_allctr_bndr_tgs_tests_NOT_BUILT sys_prog_allctr_allctr_bndr_tgs_tests_NOT_BUILT)
+endif()

@@ -6,113 +6,98 @@
 #include <pp_allocator.h>
 #include <iterator>
 #include <mutex>
+#include <vector>
+#include <cstddef>
 
 class allocator_boundary_tags final :
     public smart_mem_resource,
     public allocator_test_utils,
     public allocator_with_fit_mode
 {
-
 private:
-
-    static constexpr const size_t allocator_metadata_size = sizeof(memory_resource*) + sizeof(allocator_with_fit_mode::fit_mode) +
-                                                            sizeof(size_t) + sizeof(std::mutex) + sizeof(void*);
-
+    // Constants - must match test expectations
+    static constexpr const size_t allocator_metadata_size = sizeof(std::pmr::memory_resource*) + sizeof(allocator_with_fit_mode::fit_mode) +
+        sizeof(size_t) + sizeof(std::mutex) + sizeof(void*);
     static constexpr const size_t occupied_block_metadata_size = sizeof(size_t) + sizeof(void*) + sizeof(void*) + sizeof(void*);
-
     static constexpr const size_t free_block_metadata_size = 0;
 
     void *_trusted_memory;
 
-public:
+    // Helper methods
+    void* get_state_ptr() noexcept;
+    const void* get_state_ptr() const noexcept;
+    void* get_first_block() noexcept;
+    const void* get_first_block() const noexcept;
     
+    // Fit functions
+    void* find_first_fit(void* start, size_t needed_size);
+    void* find_best_fit(void* start, size_t needed_size);
+    void* find_worst_fit(void* start, size_t needed_size);
+
+public:
+    // Public accessors for constants
+    static constexpr size_t get_occupied_block_metadata_size() noexcept { return occupied_block_metadata_size; }
+    static constexpr size_t get_allocator_metadata_size() noexcept { return allocator_metadata_size; }
+
+public:
     ~allocator_boundary_tags() override;
     
-    allocator_boundary_tags(allocator_boundary_tags const &other);
+    allocator_boundary_tags(const allocator_boundary_tags& other);
+    allocator_boundary_tags& operator=(const allocator_boundary_tags& other);
     
-    allocator_boundary_tags &operator=(allocator_boundary_tags const &other);
-    
-    allocator_boundary_tags(
-        allocator_boundary_tags &&other) noexcept;
-    
-    allocator_boundary_tags &operator=(
-        allocator_boundary_tags &&other) noexcept;
-
-public:
+    allocator_boundary_tags(allocator_boundary_tags&& other) noexcept;
+    allocator_boundary_tags& operator=(allocator_boundary_tags&& other) noexcept;
     
     explicit allocator_boundary_tags(
-            size_t space_size,
-            std::pmr::memory_resource *parent_allocator = nullptr,
-            allocator_with_fit_mode::fit_mode allocate_fit_mode = allocator_with_fit_mode::fit_mode::first_fit);
+        size_t space_size,
+        std::pmr::memory_resource* parent_allocator = nullptr,
+        allocator_with_fit_mode::fit_mode allocate_fit_mode = allocator_with_fit_mode::fit_mode::first_fit);
 
 private:
-    
-    [[nodiscard]] void *do_allocate_sm(
-        size_t bytes) override;
-    
-    void do_deallocate_sm(
-        void *at) override;
-
+    [[nodiscard]] void* do_allocate_sm(size_t bytes) override;
+    void do_deallocate_sm(void* at) override;
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override;
 
 public:
-    
-    inline void set_fit_mode(
-        allocator_with_fit_mode::fit_mode mode) override;
-
-public:
-    
+    inline void set_fit_mode(allocator_with_fit_mode::fit_mode mode) override;
     std::vector<allocator_test_utils::block_info> get_blocks_info() const override;
 
 private:
-
     std::vector<allocator_test_utils::block_info> get_blocks_info_inner() const override;
 
-/** TODO: Highly recommended for helper functions to return references */
-
+public:
     class boundary_iterator
     {
         void* _occupied_ptr;
         bool _occupied;
         void* _trusted_memory;
-
     public:
-
         using iterator_category = std::bidirectional_iterator_tag;
         using value_type = void*;
         using reference = void*&;
         using pointer = void**;
         using difference_type = ptrdiff_t;
-
+        
         bool operator==(const boundary_iterator&) const noexcept;
-
         bool operator!=(const boundary_iterator&) const noexcept;
-
+        
         boundary_iterator& operator++() & noexcept;
-
         boundary_iterator& operator--() & noexcept;
-
         boundary_iterator operator++(int n);
-
         boundary_iterator operator--(int n);
-
+        
         size_t size() const noexcept;
-
         bool occupied() const noexcept;
-
         void* operator*() const noexcept;
-
         void* get_ptr() const noexcept;
-
+        
         boundary_iterator();
-
-        boundary_iterator(void* trusted);
+        explicit boundary_iterator(void* trusted);
     };
-
+    
     friend class boundary_iterator;
-
+    
     boundary_iterator begin() const noexcept;
-
     boundary_iterator end() const noexcept;
 };
 

@@ -29,10 +29,10 @@ public:
             allocator_with_fit_mode::fit_mode allocate_fit_mode = allocator_with_fit_mode::fit_mode::first_fit);
     
     allocator_sorted_list(
-        allocator_sorted_list const &other);
+        allocator_sorted_list const &other) = delete;
     
     allocator_sorted_list &operator=(
-        allocator_sorted_list const &other);
+        allocator_sorted_list const &other) = delete;
 
     allocator_sorted_list(
         allocator_sorted_list &&other) noexcept;

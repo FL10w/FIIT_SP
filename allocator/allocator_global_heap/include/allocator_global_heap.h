@@ -14,7 +14,6 @@ class allocator_global_heap final :
 {
 private:
     static constexpr const size_t size_t_size = sizeof(size_t);
-    mutable std::mutex allocation_mutex_;
 
 public:
     explicit allocator_global_heap();

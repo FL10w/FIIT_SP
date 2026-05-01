@@ -1,516 +1,554 @@
-#include <not_implemented.h>
 #include "../include/allocator_red_black_tree.h"
-#include <new>
-#include <mutex>
-#include <vector>
-#include <algorithm>
-#include <stdexcept>
 #include <cstring>
-#include <iostream>
-#include <functional>
-#include <cstdint>
+#include <memory>
+#include <stdexcept>
+#include <vector>
 
-// ============================================================================
-// Константы для выравнивания
-// ============================================================================
-constexpr size_t ALIGNMENT = alignof(std::max_align_t);
+constexpr size_t parent_off = 0;
+constexpr size_t mode_off = parent_off + sizeof(std::pmr::memory_resource*);
+constexpr size_t managed_off = mode_off + sizeof(allocator_with_fit_mode::fit_mode);
+constexpr size_t mutex_off = managed_off + sizeof(size_t);
+constexpr size_t root_off = mutex_off + sizeof(std::mutex);
 
-// ============================================================================
-// Используем константы из заголовочного файла
-// occupied_block_metadata_size = 25 (1 + 24)
-// free_block_metadata_size = 41 (1 + 40)
-// ============================================================================
+constexpr size_t bd_off = 0;
+constexpr size_t bd_sz = sizeof(unsigned char);
+constexpr size_t s0_off = bd_off + bd_sz;
+constexpr size_t s1_off = s0_off + sizeof(void*);
+constexpr size_t s2_off = s1_off + sizeof(void*);
+constexpr size_t s3_off = s2_off + sizeof(void*);
+constexpr size_t s4_off = s3_off + sizeof(void*);
 
-// ============================================================================
-// Смещения метаданных в _trusted_memory
-// ============================================================================
-constexpr size_t OFFSET_PARENT_RESOURCE = 0;
-constexpr size_t OFFSET_FIT_MODE = sizeof(void*);
-constexpr size_t OFFSET_TOTAL_SIZE = OFFSET_FIT_MODE + sizeof(size_t);
-constexpr size_t OFFSET_MUTEX = OFFSET_TOTAL_SIZE + sizeof(size_t);
-constexpr size_t OFFSET_RB_ROOT = OFFSET_MUTEX + sizeof(std::mutex);
+constexpr size_t occ_md = bd_sz + 3 * sizeof(void*);
+constexpr size_t free_md = bd_sz + 5 * sizeof(void*);
+constexpr size_t md_delta = free_md - occ_md;
 
-// ============================================================================
-// Смещения в заголовках блоков (согласно заголовочному файлу)
-// block_data = 1 byte (bit fields: 4 bits occupied, 4 bits color)
-// ============================================================================
-constexpr size_t OFFSET_BLOCK_DATA = 0;
-constexpr size_t OFFSET_BLOCK_SIZE = sizeof(allocator_red_black_tree::block_data); // 1 byte
-constexpr size_t OFFSET_BLOCK_PREV = OFFSET_BLOCK_SIZE + sizeof(size_t); // 1 + 8 = 9
-constexpr size_t OFFSET_BLOCK_NEXT_OCC = OFFSET_BLOCK_PREV + sizeof(void*); // 9 + 8 = 17
-constexpr size_t OFFSET_BLOCK_PARENT = OFFSET_BLOCK_PREV + sizeof(void*); // 9 + 8 = 17
-constexpr size_t OFFSET_BLOCK_LEFT = OFFSET_BLOCK_PARENT + sizeof(void*); // 17 + 8 = 25
-constexpr size_t OFFSET_BLOCK_RIGHT = OFFSET_BLOCK_LEFT + sizeof(void*); // 25 + 8 = 33
+constexpr unsigned char c_red = 0;
+constexpr unsigned char c_black = 1;
 
-// ============================================================================
-// Helper-функции для доступа к метаданным аллокатора
-// ============================================================================
-static std::pmr::memory_resource** get_parent_resource_ptr(void* trusted) {
-    return reinterpret_cast<std::pmr::memory_resource**>(
-        reinterpret_cast<char*>(trusted) + OFFSET_PARENT_RESOURCE);
+static void *lp(const char *p, size_t off)
+{
+    void *v = nullptr;
+    std::memcpy(&v, p + off, sizeof(v));
+    return v;
 }
 
-static size_t* get_fit_mode_ptr(void* trusted) {
-    return reinterpret_cast<size_t*>(
-        reinterpret_cast<char*>(trusted) + OFFSET_FIT_MODE);
+static void sp(char *p, size_t off, void *v)
+{
+    std::memcpy(p + off, &v, sizeof(v));
 }
 
-static size_t* get_total_size_ptr(void* trusted) {
-    return reinterpret_cast<size_t*>(
-        reinterpret_cast<char*>(trusted) + OFFSET_TOTAL_SIZE);
+static size_t ls(const char *p, size_t off)
+{
+    size_t v = 0;
+    std::memcpy(&v, p + off, sizeof(v));
+    return v;
 }
 
-static std::mutex* get_mutex_ptr(void* trusted) {
-    return reinterpret_cast<std::mutex*>(
-        reinterpret_cast<char*>(trusted) + OFFSET_MUTEX);
+static void ss(char *p, size_t off, size_t v)
+{
+    std::memcpy(p + off, &v, sizeof(v));
 }
 
-static void** get_rb_root_ptr(void* trusted) {
-    return reinterpret_cast<void**>(
-        reinterpret_cast<char*>(trusted) + OFFSET_RB_ROOT);
+static unsigned char lb(const char *p)
+{
+    unsigned char v = 0;
+    std::memcpy(&v, p + bd_off, sizeof(v));
+    return v;
 }
 
-// ============================================================================
-// Helper-функции для доступа к заголовкам блоков
-// ============================================================================
-static unsigned char* get_block_data_byte(void* block) {
-    return reinterpret_cast<unsigned char*>(
-        reinterpret_cast<char*>(block) + OFFSET_BLOCK_DATA);
+static void sb(char *p, unsigned char v)
+{
+    std::memcpy(p + bd_off, &v, sizeof(v));
 }
 
-static size_t* get_block_size_ptr(void* block) {
-    return reinterpret_cast<size_t*>(
-        reinterpret_cast<char*>(block) + OFFSET_BLOCK_SIZE);
+static bool occ(const char *b)
+{
+    return (lb(b) & 0x0F) != 0;
 }
 
-static void** get_block_prev_ptr(void* block) {
-    return reinterpret_cast<void**>(
-        reinterpret_cast<char*>(block) + OFFSET_BLOCK_PREV);
-}
-
-static void** get_block_next_ptr(void* block) {
-    return reinterpret_cast<void**>(
-        reinterpret_cast<char*>(block) + OFFSET_BLOCK_NEXT_OCC);
-}
-
-static void** get_block_parent_ptr(void* block) {
-    return reinterpret_cast<void**>(
-        reinterpret_cast<char*>(block) + OFFSET_BLOCK_PARENT);
-}
-
-static void** get_block_left_ptr(void* block) {
-    return reinterpret_cast<void**>(
-        reinterpret_cast<char*>(block) + OFFSET_BLOCK_LEFT);
-}
-
-static void** get_block_right_ptr(void* block) {
-    return reinterpret_cast<void**>(
-        reinterpret_cast<char*>(block) + OFFSET_BLOCK_RIGHT);
-}
-
-// ============================================================================
-// Функции работы с блоками
-// ============================================================================
-static bool is_occupied(void* block) {
-    unsigned char byte = *get_block_data_byte(block);
-    return (byte & 0x0F) != 0;
-}
-
-static void set_occupied(void* block, bool occ) {
-    unsigned char* ptr = get_block_data_byte(block);
-    unsigned char color = (*ptr & 0xF0);
-    *ptr = color | (occ ? 0x01 : 0x00);
-}
-
-static unsigned char get_color_byte(void* block) {
-    unsigned char byte = *get_block_data_byte(block);
-    return (byte & 0xF0) >> 4;
-}
-
-static void set_color_byte(void* block, unsigned char color) {
-    unsigned char* ptr = get_block_data_byte(block);
-    unsigned char occ = (*ptr & 0x0F);
-    *ptr = occ | ((color & 0x01) << 4);
-}
-
-static size_t get_block_size(void* block) {
-    return *get_block_size_ptr(block);
-}
-
-static void set_block_size(void* block, size_t size) {
-    *get_block_size_ptr(block) = size;
-}
-
-// Вычисляем смещение до пользовательских данных с учётом выравнивания
-static size_t get_header_offset(bool occupied) {
-    size_t header_size = occupied ? 
-        allocator_red_black_tree::occupied_block_metadata_size : 
-        allocator_red_black_tree::free_block_metadata_size;
-    // Выравниваем смещение до ALIGNMENT
-    return (header_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-}
-
-static void* get_user_ptr(void* block) {
-    size_t offset = get_header_offset(is_occupied(block));
-    return reinterpret_cast<char*>(block) + offset;
-}
-
-// Для поиска блока по пользовательскому указателю используем максимальное смещение
-static constexpr size_t MAX_HEADER_OFFSET = 48; // 41 + 7 padding max
-
-static void* get_block_ptr_from_user(void* user) {
-    // Проверяем возможные смещения (25->32, 41->48 с выравниванием)
-    char* cand32 = reinterpret_cast<char*>(user) - 32;
-    char* cand48 = reinterpret_cast<char*>(user) - 48;
-    
-    // Проверяем哪个 является валидным заголовком
-    if (is_occupied(cand32)) {
-        return cand32;
+static unsigned char color_of(const char *b)
+{
+    if (b == nullptr)
+    {
+        return c_black;
     }
-    return cand48;
+    return static_cast<unsigned char>((lb(b) >> 4) & 0x0F);
 }
 
-static void* get_next_block(void* block, void* trusted_end) {
-    size_t offset = get_header_offset(is_occupied(block));
-    size_t size = get_block_size(block);
-    size_t total = offset + size;
-    // Выравниваем общий размер до ALIGNMENT
-    total = (total + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-    
-    char* next = reinterpret_cast<char*>(block) + total;
-    if (next >= trusted_end) return nullptr;
-    return next;
-}
-
-// ============================================================================
-// Функции Красно-Чёрного Дерева
-// ============================================================================
-static void* rb_parent(void* node) {
-    if (!node || is_occupied(node)) return nullptr;
-    return *get_block_parent_ptr(node);
-}
-
-static void set_rb_parent(void* node, void* parent) {
-    if (!node || is_occupied(node)) return;
-    *get_block_parent_ptr(node) = parent;
-}
-
-static void* rb_left(void* node) {
-    if (!node || is_occupied(node)) return nullptr;
-    return *get_block_left_ptr(node);
-}
-
-static void set_rb_left(void* node, void* left) {
-    if (!node || is_occupied(node)) return;
-    *get_block_left_ptr(node) = left;
-}
-
-static void* rb_right(void* node) {
-    if (!node || is_occupied(node)) return nullptr;
-    return *get_block_right_ptr(node);
-}
-
-static void set_rb_right(void* node, void* right) {
-    if (!node || is_occupied(node)) return;
-    *get_block_right_ptr(node) = right;
-}
-
-static void rb_rotate_left(void* trusted, void* x) {
-    void* y = rb_right(x);
-    set_rb_right(x, rb_left(y));
-    if (rb_left(y)) set_rb_parent(rb_left(y), x);
-    set_rb_parent(y, rb_parent(x));
-    if (!rb_parent(x)) {
-        *get_rb_root_ptr(trusted) = y;
-    } else if (x == rb_left(rb_parent(x))) {
-        set_rb_left(rb_parent(x), y);
-    } else {
-        set_rb_right(rb_parent(x), y);
+static void set_color(char *b, unsigned char c)
+{
+    if (b == nullptr)
+    {
+        return;
     }
-    set_rb_left(y, x);
-    set_rb_parent(x, y);
+    unsigned char v = lb(b);
+    v = static_cast<unsigned char>((v & 0x0F) | ((c & 0x0F) << 4));
+    sb(b, v);
 }
 
-static void rb_rotate_right(void* trusted, void* x) {
-    void* y = rb_left(x);
-    set_rb_left(x, rb_right(y));
-    if (rb_right(y)) set_rb_parent(rb_right(y), x);
-    set_rb_parent(y, rb_parent(x));
-    if (!rb_parent(x)) {
-        *get_rb_root_ptr(trusted) = y;
-    } else if (x == rb_right(rb_parent(x))) {
-        set_rb_right(rb_parent(x), y);
-    } else {
-        set_rb_left(rb_parent(x), y);
+static size_t free_sz(const char *b)
+{
+    return ls(b, s3_off);
+}
+
+static size_t occ_sz(const char *b)
+{
+    return ls(b, s1_off);
+}
+
+static size_t blk_sz(const char *b)
+{
+    return occ(b) ? occ_sz(b) : free_sz(b);
+}
+
+static size_t user_sz(const char *b)
+{
+    if (!occ(b))
+    {
+        return free_sz(b);
     }
-    set_rb_right(y, x);
-    set_rb_parent(x, y);
+    const size_t raw = occ_sz(b);
+    return raw >= md_delta ? (raw - md_delta) : 0;
 }
 
-static void rb_insert_fixup(void* trusted, void* z) {
-    while (true) {
-        void* p = rb_parent(z);
-        if (!p) {
-            set_color_byte(z, 1); // BLACK
+static char *root(char *trusted)
+{
+    return reinterpret_cast<char*>(lp(trusted, root_off));
+}
+
+static void set_root(char *trusted, char *node)
+{
+    sp(trusted, root_off, node);
+}
+
+static bool less_node(char *a, char *b)
+{
+    const size_t as = free_sz(a);
+    const size_t bs = free_sz(b);
+    if (as != bs)
+    {
+        return as < bs;
+    }
+    return a < b;
+}
+
+static char *next_blk(char *b)
+{
+    return b + free_md + blk_sz(b);
+}
+
+static void mark_occ(char *b, void *owner, size_t payload_plus_delta, char *prev)
+{
+    sb(b, static_cast<unsigned char>(1 | (c_black << 4)));
+    sp(b, s0_off, owner);
+    ss(b, s1_off, payload_plus_delta);
+    sp(b, s2_off, prev);
+}
+
+static void mark_free(char *b, size_t payload, char *prev)
+{
+    sb(b, static_cast<unsigned char>(c_red << 4));
+    sp(b, s0_off, nullptr);
+    sp(b, s1_off, nullptr);
+    sp(b, s2_off, nullptr);
+    ss(b, s3_off, payload);
+    sp(b, s4_off, prev);
+}
+
+static void left_rotate(char *trusted, char *x)
+{
+    char *y = reinterpret_cast<char*>(lp(x, s2_off));
+    char *yl = reinterpret_cast<char*>(lp(y, s1_off));
+    sp(x, s2_off, yl);
+    if (yl != nullptr)
+    {
+        sp(yl, s0_off, x);
+    }
+    char *xp = reinterpret_cast<char*>(lp(x, s0_off));
+    sp(y, s0_off, xp);
+    if (xp == nullptr)
+    {
+        set_root(trusted, y);
+    }
+    else if (x == reinterpret_cast<char*>(lp(xp, s1_off)))
+    {
+        sp(xp, s1_off, y);
+    }
+    else
+    {
+        sp(xp, s2_off, y);
+    }
+    sp(y, s1_off, x);
+    sp(x, s0_off, y);
+}
+
+static void right_rotate(char *trusted, char *y)
+{
+    char *x = reinterpret_cast<char*>(lp(y, s1_off));
+    char *xr = reinterpret_cast<char*>(lp(x, s2_off));
+    sp(y, s1_off, xr);
+    if (xr != nullptr)
+    {
+        sp(xr, s0_off, y);
+    }
+    char *yp = reinterpret_cast<char*>(lp(y, s0_off));
+    sp(x, s0_off, yp);
+    if (yp == nullptr)
+    {
+        set_root(trusted, x);
+    }
+    else if (y == reinterpret_cast<char*>(lp(yp, s2_off)))
+    {
+        sp(yp, s2_off, x);
+    }
+    else
+    {
+        sp(yp, s1_off, x);
+    }
+    sp(x, s2_off, y);
+    sp(y, s0_off, x);
+}
+
+static void rb_insert_fixup(char *trusted, char *z)
+{
+    while (z != nullptr)
+    {
+        char *p = reinterpret_cast<char*>(lp(z, s0_off));
+        if (p == nullptr || color_of(p) != c_red)
+        {
             break;
         }
-        if (get_color_byte(p) == 1) break; // BLACK
-        
-        void* g = rb_parent(p);
-        if (!g) break;
-        
-        void* u = (p == rb_left(g)) ? rb_right(g) : rb_left(g);
-        
-        if (u && get_color_byte(u) == 0) { // RED
-            set_color_byte(p, 1); // BLACK
-            set_color_byte(u, 1); // BLACK
-            set_color_byte(g, 0); // RED
-            z = g;
-        } else {
-            if (p == rb_left(g)) {
-                if (z == rb_right(p)) {
-                    z = p;
-                    rb_rotate_left(trusted, z);
-                    p = rb_parent(z);
-                    g = rb_parent(p);
-                }
-                set_color_byte(p, 1); // BLACK
-                set_color_byte(g, 0); // RED
-                rb_rotate_right(trusted, g);
-            } else {
-                if (z == rb_left(p)) {
-                    z = p;
-                    rb_rotate_right(trusted, z);
-                    p = rb_parent(z);
-                    g = rb_parent(p);
-                }
-                set_color_byte(p, 1); // BLACK
-                set_color_byte(g, 0); // RED
-                rb_rotate_left(trusted, g);
+        char *g = reinterpret_cast<char*>(lp(p, s0_off));
+        if (p == reinterpret_cast<char*>(lp(g, s1_off)))
+        {
+            char *u = reinterpret_cast<char*>(lp(g, s2_off));
+            if (color_of(u) == c_red)
+            {
+                set_color(p, c_black);
+                set_color(u, c_black);
+                set_color(g, c_red);
+                z = g;
             }
-            break;
+            else
+            {
+                if (z == reinterpret_cast<char*>(lp(p, s2_off)))
+                {
+                    z = p;
+                    left_rotate(trusted, z);
+                    p = reinterpret_cast<char*>(lp(z, s0_off));
+                    g = reinterpret_cast<char*>(lp(p, s0_off));
+                }
+                set_color(p, c_black);
+                set_color(g, c_red);
+                right_rotate(trusted, g);
+            }
+        }
+        else
+        {
+            char *u = reinterpret_cast<char*>(lp(g, s1_off));
+            if (color_of(u) == c_red)
+            {
+                set_color(p, c_black);
+                set_color(u, c_black);
+                set_color(g, c_red);
+                z = g;
+            }
+            else
+            {
+                if (z == reinterpret_cast<char*>(lp(p, s1_off)))
+                {
+                    z = p;
+                    right_rotate(trusted, z);
+                    p = reinterpret_cast<char*>(lp(z, s0_off));
+                    g = reinterpret_cast<char*>(lp(p, s0_off));
+                }
+                set_color(p, c_black);
+                set_color(g, c_red);
+                left_rotate(trusted, g);
+            }
         }
     }
+    set_color(root(trusted), c_black);
 }
 
-static void rb_insert(void* trusted, void* z) {
-    set_rb_left(z, nullptr);
-    set_rb_right(z, nullptr);
-    set_color_byte(z, 0); // RED
-    
-    void* y = nullptr;
-    void* x = *get_rb_root_ptr(trusted);
-    
-    while (x) {
+static void rb_insert(char *trusted, char *node)
+{
+    sp(node, s0_off, nullptr);
+    sp(node, s1_off, nullptr);
+    sp(node, s2_off, nullptr);
+    set_color(node, c_red);
+
+    char *y = nullptr;
+    char *x = root(trusted);
+    while (x != nullptr)
+    {
         y = x;
-        if (z < x) {
-            x = rb_left(x);
-        } else {
-            x = rb_right(x);
-        }
+        x = less_node(node, x) ? reinterpret_cast<char*>(lp(x, s1_off)) : reinterpret_cast<char*>(lp(x, s2_off));
     }
-    
-    set_rb_parent(z, y);
-    if (!y) {
-        *get_rb_root_ptr(trusted) = z;
-    } else if (z < y) {
-        set_rb_left(y, z);
-    } else {
-        set_rb_right(y, z);
+    sp(node, s0_off, y);
+    if (y == nullptr)
+    {
+        set_root(trusted, node);
     }
-    
-    rb_insert_fixup(trusted, z);
+    else if (less_node(node, y))
+    {
+        sp(y, s1_off, node);
+    }
+    else
+    {
+        sp(y, s2_off, node);
+    }
+    rb_insert_fixup(trusted, node);
 }
 
-static void rb_transplant(void* trusted, void* u, void* v) {
-    if (!rb_parent(u)) {
-        *get_rb_root_ptr(trusted) = v;
-    } else if (u == rb_left(rb_parent(u))) {
-        set_rb_left(rb_parent(u), v);
-    } else {
-        set_rb_right(rb_parent(u), v);
+static char *rb_min(char *node)
+{
+    while (node != nullptr && reinterpret_cast<char*>(lp(node, s1_off)) != nullptr)
+    {
+        node = reinterpret_cast<char*>(lp(node, s1_off));
     }
-    if (v) set_rb_parent(v, rb_parent(u));
-}
-
-static void* rb_minimum(void* node) {
-    while (rb_left(node)) node = rb_left(node);
     return node;
 }
 
-static void rb_delete_fixup(void* trusted, void* x) {
-    while (x != *get_rb_root_ptr(trusted) && 
-           (!x || get_color_byte(x) == 1)) {
-        if (x == rb_left(rb_parent(x))) {
-            void* w = rb_right(rb_parent(x));
-            if (get_color_byte(w) == 0) {
-                set_color_byte(w, 1);
-                set_color_byte(rb_parent(x), 0);
-                rb_rotate_left(trusted, rb_parent(x));
-                w = rb_right(rb_parent(x));
+static void rb_transplant(char *trusted, char *u, char *v)
+{
+    char *up = reinterpret_cast<char*>(lp(u, s0_off));
+    if (up == nullptr)
+    {
+        set_root(trusted, v);
+    }
+    else if (u == reinterpret_cast<char*>(lp(up, s1_off)))
+    {
+        sp(up, s1_off, v);
+    }
+    else
+    {
+        sp(up, s2_off, v);
+    }
+    if (v != nullptr)
+    {
+        sp(v, s0_off, up);
+    }
+}
+
+static void rb_delete_fixup(char *trusted, char *x, char *xp)
+{
+    while (x != root(trusted) && color_of(x) == c_black)
+    {
+        if (xp == nullptr)
+        {
+            break;
+        }
+        if (x == reinterpret_cast<char*>(lp(xp, s1_off)))
+        {
+            char *w = reinterpret_cast<char*>(lp(xp, s2_off));
+            if (color_of(w) == c_red)
+            {
+                set_color(w, c_black);
+                set_color(xp, c_red);
+                left_rotate(trusted, xp);
+                w = reinterpret_cast<char*>(lp(xp, s2_off));
             }
-            if ((!rb_left(w) || get_color_byte(rb_left(w)) == 1) &&
-                (!rb_right(w) || get_color_byte(rb_right(w)) == 1)) {
-                set_color_byte(w, 0);
-                x = rb_parent(x);
-            } else {
-                if (!rb_right(w) || get_color_byte(rb_right(w)) == 1) {
-                    if (rb_left(w)) set_color_byte(rb_left(w), 1);
-                    set_color_byte(w, 0);
-                    rb_rotate_right(trusted, w);
-                    w = rb_right(rb_parent(x));
+            char *wl = (w == nullptr) ? nullptr : reinterpret_cast<char*>(lp(w, s1_off));
+            char *wr = (w == nullptr) ? nullptr : reinterpret_cast<char*>(lp(w, s2_off));
+            if (color_of(wl) == c_black && color_of(wr) == c_black)
+            {
+                set_color(w, c_red);
+                x = xp;
+                xp = reinterpret_cast<char*>(lp(xp, s0_off));
+            }
+            else
+            {
+                if (color_of(wr) == c_black)
+                {
+                    set_color(wl, c_black);
+                    set_color(w, c_red);
+                    right_rotate(trusted, w);
+                    w = reinterpret_cast<char*>(lp(xp, s2_off));
+                    wl = (w == nullptr) ? nullptr : reinterpret_cast<char*>(lp(w, s1_off));
+                    wr = (w == nullptr) ? nullptr : reinterpret_cast<char*>(lp(w, s2_off));
                 }
-                set_color_byte(w, get_color_byte(rb_parent(x)));
-                set_color_byte(rb_parent(x), 1);
-                if (rb_right(w)) set_color_byte(rb_right(w), 1);
-                rb_rotate_left(trusted, rb_parent(x));
-                x = *get_rb_root_ptr(trusted);
+                set_color(w, color_of(xp));
+                set_color(xp, c_black);
+                set_color(wr, c_black);
+                left_rotate(trusted, xp);
+                x = root(trusted);
+                xp = nullptr;
             }
-        } else {
-            void* w = rb_left(rb_parent(x));
-            if (get_color_byte(w) == 0) {
-                set_color_byte(w, 1);
-                set_color_byte(rb_parent(x), 0);
-                rb_rotate_right(trusted, rb_parent(x));
-                w = rb_left(rb_parent(x));
+        }
+        else
+        {
+            char *w = reinterpret_cast<char*>(lp(xp, s1_off));
+            if (color_of(w) == c_red)
+            {
+                set_color(w, c_black);
+                set_color(xp, c_red);
+                right_rotate(trusted, xp);
+                w = reinterpret_cast<char*>(lp(xp, s1_off));
             }
-            if ((!rb_right(w) || get_color_byte(rb_right(w)) == 1) &&
-                (!rb_left(w) || get_color_byte(rb_left(w)) == 1)) {
-                set_color_byte(w, 0);
-                x = rb_parent(x);
-            } else {
-                if (!rb_left(w) || get_color_byte(rb_left(w)) == 1) {
-                    if (rb_right(w)) set_color_byte(rb_right(w), 1);
-                    set_color_byte(w, 0);
-                    rb_rotate_left(trusted, w);
-                    w = rb_left(rb_parent(x));
+            char *wl = (w == nullptr) ? nullptr : reinterpret_cast<char*>(lp(w, s1_off));
+            char *wr = (w == nullptr) ? nullptr : reinterpret_cast<char*>(lp(w, s2_off));
+            if (color_of(wr) == c_black && color_of(wl) == c_black)
+            {
+                set_color(w, c_red);
+                x = xp;
+                xp = reinterpret_cast<char*>(lp(xp, s0_off));
+            }
+            else
+            {
+                if (color_of(wl) == c_black)
+                {
+                    set_color(wr, c_black);
+                    set_color(w, c_red);
+                    left_rotate(trusted, w);
+                    w = reinterpret_cast<char*>(lp(xp, s1_off));
+                    wl = (w == nullptr) ? nullptr : reinterpret_cast<char*>(lp(w, s1_off));
+                    wr = (w == nullptr) ? nullptr : reinterpret_cast<char*>(lp(w, s2_off));
                 }
-                set_color_byte(w, get_color_byte(rb_parent(x)));
-                set_color_byte(rb_parent(x), 1);
-                if (rb_left(w)) set_color_byte(rb_left(w), 1);
-                rb_rotate_right(trusted, rb_parent(x));
-                x = *get_rb_root_ptr(trusted);
+                set_color(w, color_of(xp));
+                set_color(xp, c_black);
+                set_color(wl, c_black);
+                right_rotate(trusted, xp);
+                x = root(trusted);
+                xp = nullptr;
             }
         }
     }
-    if (x) set_color_byte(x, 1);
+    set_color(x, c_black);
 }
 
-static void rb_delete(void* trusted, void* z) {
-    void* y = z;
-    unsigned char y_original_color = get_color_byte(y);
-    void* x = nullptr;
-    
-    if (!rb_left(z)) {
-        x = rb_right(z);
-        rb_transplant(trusted, z, rb_right(z));
-    } else if (!rb_right(z)) {
-        x = rb_left(z);
-        rb_transplant(trusted, z, rb_left(z));
-    } else {
-        y = rb_minimum(rb_right(z));
-        y_original_color = get_color_byte(y);
-        x = rb_right(y);
-        if (rb_parent(y) == z) {
-            if (x) set_rb_parent(x, y);
-        } else {
-            rb_transplant(trusted, y, rb_right(y));
-            set_rb_right(y, rb_right(z));
-            set_rb_parent(rb_right(y), y);
+static void rb_delete(char *trusted, char *z)
+{
+    char *y = z;
+    unsigned char y_color = color_of(y);
+    char *x = nullptr;
+    char *xp = nullptr;
+
+    if (reinterpret_cast<char*>(lp(z, s1_off)) == nullptr)
+    {
+        x = reinterpret_cast<char*>(lp(z, s2_off));
+        xp = reinterpret_cast<char*>(lp(z, s0_off));
+        rb_transplant(trusted, z, reinterpret_cast<char*>(lp(z, s2_off)));
+    }
+    else if (reinterpret_cast<char*>(lp(z, s2_off)) == nullptr)
+    {
+        x = reinterpret_cast<char*>(lp(z, s1_off));
+        xp = reinterpret_cast<char*>(lp(z, s0_off));
+        rb_transplant(trusted, z, reinterpret_cast<char*>(lp(z, s1_off)));
+    }
+    else
+    {
+        y = rb_min(reinterpret_cast<char*>(lp(z, s2_off)));
+        y_color = color_of(y);
+        x = reinterpret_cast<char*>(lp(y, s2_off));
+        if (reinterpret_cast<char*>(lp(y, s0_off)) == z)
+        {
+            xp = y;
+            if (x != nullptr)
+            {
+                sp(x, s0_off, y);
+            }
+        }
+        else
+        {
+            xp = reinterpret_cast<char*>(lp(y, s0_off));
+            rb_transplant(trusted, y, reinterpret_cast<char*>(lp(y, s2_off)));
+            sp(y, s2_off, reinterpret_cast<char*>(lp(z, s2_off)));
+            sp(reinterpret_cast<char*>(lp(y, s2_off)), s0_off, y);
         }
         rb_transplant(trusted, z, y);
-        set_rb_left(y, rb_left(z));
-        set_rb_parent(rb_left(y), y);
-        set_color_byte(y, get_color_byte(z));
+        sp(y, s1_off, reinterpret_cast<char*>(lp(z, s1_off)));
+        sp(reinterpret_cast<char*>(lp(y, s1_off)), s0_off, y);
+        set_color(y, color_of(z));
     }
-    
-    if (y_original_color == 1) {
-        rb_delete_fixup(trusted, x);
+
+    if (y_color == c_black)
+    {
+        rb_delete_fixup(trusted, x, xp);
     }
 }
-
-static void* rb_find_fit(void* trusted, size_t size, size_t mode) {
-    void* root = *get_rb_root_ptr(trusted);
-    if (!root) return nullptr;
-    
-    void* best = nullptr;
-    
-    std::function<void(void*)> traverse = [&](void* node) {
-        if (!node) return;
-        
-        traverse(rb_left(node));
-        
-        if (get_block_size(node) >= size) {
-            if (mode == 0) { // first_fit
-                if (!best) best = node;
-            } else if (mode == 1) { // the_best_fit
-                if (!best || get_block_size(node) < get_block_size(best)) {
-                    best = node;
-                } else if (get_block_size(node) == get_block_size(best) && node < best) {
-                    best = node;
-                }
-            } else if (mode == 2) { // the_worst_fit
-                if (!best || get_block_size(node) > get_block_size(best)) {
-                    best = node;
-                } else if (get_block_size(node) == get_block_size(best) && node < best) {
-                    best = node;
-                }
-            }
-        }
-        
-        traverse(rb_right(node));
-    };
-    
-    traverse(root);
-    return best;
-}
-
-// ============================================================================
-// Реализация методов класса allocator_red_black_tree
-// ============================================================================
 
 allocator_red_black_tree::~allocator_red_black_tree()
 {
-    if (_trusted_memory) {
-        std::mutex* mtx = get_mutex_ptr(_trusted_memory);
-        mtx->~mutex();
-        
-        size_t total_size = *get_total_size_ptr(_trusted_memory);
-        std::pmr::memory_resource* parent = *get_parent_resource_ptr(_trusted_memory);
-        
-        if (parent) {
-            parent->deallocate(_trusted_memory, total_size, ALIGNMENT);
-        } else {
-            ::operator delete(_trusted_memory);
-        }
-        _trusted_memory = nullptr;
+    if (_trusted_memory == nullptr)
+    {
+        return;
     }
+    char *base = reinterpret_cast<char*>(_trusted_memory);
+    auto *parent = reinterpret_cast<std::pmr::memory_resource*>(lp(base, parent_off));
+    const size_t managed = ls(base, managed_off);
+    auto *mtx = reinterpret_cast<std::mutex*>(base + mutex_off);
+    std::destroy_at(mtx);
+    parent->deallocate(_trusted_memory, allocator_metadata_size + free_block_metadata_size + managed);
+    _trusted_memory = nullptr;
 }
 
-allocator_red_black_tree::allocator_red_black_tree(
-    allocator_red_black_tree &&other) noexcept
+allocator_red_black_tree::allocator_red_black_tree(allocator_red_black_tree &&other) noexcept:
+    _trusted_memory(nullptr)
 {
-    if (other._trusted_memory) {
-        std::lock_guard<std::mutex> lock(*get_mutex_ptr(other._trusted_memory));
+    if (other._trusted_memory == nullptr)
+    {
+        return;
+    }
+    char *ob = reinterpret_cast<char*>(other._trusted_memory);
+    auto *om = reinterpret_cast<std::mutex*>(ob + mutex_off);
+    std::lock_guard<std::mutex> lock(*om);
+    _trusted_memory = other._trusted_memory;
+    other._trusted_memory = nullptr;
+}
+
+allocator_red_black_tree &allocator_red_black_tree::operator=(allocator_red_black_tree &&other) noexcept
+{
+    if (this == &other)
+    {
+        return *this;
+    }
+    std::mutex *tm = nullptr;
+    if (_trusted_memory != nullptr)
+    {
+        tm = reinterpret_cast<std::mutex*>(reinterpret_cast<char*>(_trusted_memory) + mutex_off);
+    }
+    std::mutex *om = nullptr;
+    if (other._trusted_memory != nullptr)
+    {
+        om = reinterpret_cast<std::mutex*>(reinterpret_cast<char*>(other._trusted_memory) + mutex_off);
+    }
+    void *old = nullptr;
+    if (tm != nullptr && om != nullptr && tm != om)
+    {
+        std::scoped_lock lock(*tm, *om);
+        old = _trusted_memory;
         _trusted_memory = other._trusted_memory;
         other._trusted_memory = nullptr;
-    } else {
-        _trusted_memory = nullptr;
     }
-}
-
-allocator_red_black_tree &allocator_red_black_tree::operator=(
-    allocator_red_black_tree &&other) noexcept
-{
-    if (this != &other) {
-        this->~allocator_red_black_tree();
-        if (other._trusted_memory) {
-            std::lock_guard<std::mutex> lock(*get_mutex_ptr(other._trusted_memory));
-            _trusted_memory = other._trusted_memory;
-            other._trusted_memory = nullptr;
-        } else {
-            _trusted_memory = nullptr;
-        }
+    else if (tm != nullptr)
+    {
+        std::lock_guard<std::mutex> lock(*tm);
+        old = _trusted_memory;
+        _trusted_memory = other._trusted_memory;
+        other._trusted_memory = nullptr;
+    }
+    else if (om != nullptr)
+    {
+        std::lock_guard<std::mutex> lock(*om);
+        old = _trusted_memory;
+        _trusted_memory = other._trusted_memory;
+        other._trusted_memory = nullptr;
+    }
+    else
+    {
+        old = _trusted_memory;
+        _trusted_memory = other._trusted_memory;
+        other._trusted_memory = nullptr;
+    }
+    if (old != nullptr)
+    {
+        char *b = reinterpret_cast<char*>(old);
+        auto *parent = reinterpret_cast<std::pmr::memory_resource*>(lp(b, parent_off));
+        size_t managed = ls(b, managed_off);
+        auto *m = reinterpret_cast<std::mutex*>(b + mutex_off);
+        std::destroy_at(m);
+        parent->deallocate(old, allocator_metadata_size + free_block_metadata_size + managed);
     }
     return *this;
 }
@@ -520,313 +558,307 @@ allocator_red_black_tree::allocator_red_black_tree(
     std::pmr::memory_resource *parent_allocator,
     allocator_with_fit_mode::fit_mode allocate_fit_mode)
 {
-    if (parent_allocator) {
-        _trusted_memory = parent_allocator->allocate(space_size, ALIGNMENT);
-    } else {
-        _trusted_memory = ::operator new(space_size);
+    if (parent_allocator == nullptr)
+    {
+        parent_allocator = std::pmr::get_default_resource();
     }
-    
-    // Инициализируем метаданные нулями
-    std::memset(_trusted_memory, 0, allocator_metadata_size);
-    
-    *get_parent_resource_ptr(_trusted_memory) = parent_allocator;
-    *get_fit_mode_ptr(_trusted_memory) = static_cast<size_t>(allocate_fit_mode);
-    *get_total_size_ptr(_trusted_memory) = space_size;
-    
-    new (get_mutex_ptr(_trusted_memory)) std::mutex();
-    *get_rb_root_ptr(_trusted_memory) = nullptr;
-    
-    // Вычисляем начало блоков с выравниванием
-    char* metadata_end = reinterpret_cast<char*>(_trusted_memory) + allocator_metadata_size;
-    char* blocks_start = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(metadata_end) + ALIGNMENT - 1) & ~(ALIGNMENT - 1));
-    
-    size_t metadata_size_used = blocks_start - reinterpret_cast<char*>(_trusted_memory);
-    size_t available_for_blocks = space_size - metadata_size_used;
-    
-    // Создаём первый свободный блок
-    if (available_for_blocks >= free_block_metadata_size + ALIGNMENT) {
-        void* first_block = blocks_start;
-        set_occupied(first_block, false);
-        set_color_byte(first_block, 1); // BLACK
-        set_block_size(first_block, available_for_blocks - get_header_offset(false));
-        *get_block_prev_ptr(first_block) = nullptr;
-        *get_block_parent_ptr(first_block) = nullptr;
-        *get_block_left_ptr(first_block) = nullptr;
-        *get_block_right_ptr(first_block) = nullptr;
-        
-        rb_insert(_trusted_memory, first_block);
-    }
+    _trusted_memory = parent_allocator->allocate(allocator_metadata_size + free_block_metadata_size + space_size);
+    char *base = reinterpret_cast<char*>(_trusted_memory);
+    sp(base, parent_off, parent_allocator);
+    std::memcpy(base + mode_off, &allocate_fit_mode, sizeof(allocate_fit_mode));
+    ss(base, managed_off, space_size);
+    new (base + mutex_off) std::mutex();
+
+    char *first = base + allocator_metadata_size;
+    mark_free(first, space_size, nullptr);
+    set_color(first, c_black);
+    set_root(base, first);
 }
 
 allocator_red_black_tree::allocator_red_black_tree(const allocator_red_black_tree &other)
 {
-    if (!other._trusted_memory) {
+    if (other._trusted_memory == nullptr)
+    {
         _trusted_memory = nullptr;
         return;
     }
-    
-    size_t space_size = *get_total_size_ptr(other._trusted_memory);
-    std::pmr::memory_resource* parent = *get_parent_resource_ptr(other._trusted_memory);
-    
-    if (parent) {
-        _trusted_memory = parent->allocate(space_size, ALIGNMENT);
-    } else {
-        _trusted_memory = ::operator new(space_size);
+    char *ob = reinterpret_cast<char*>(other._trusted_memory);
+    auto *om = reinterpret_cast<std::mutex*>(ob + mutex_off);
+    std::lock_guard<std::mutex> lock(*om);
+
+    auto *parent = reinterpret_cast<std::pmr::memory_resource*>(lp(ob, parent_off));
+    auto mode = *reinterpret_cast<allocator_with_fit_mode::fit_mode*>(ob + mode_off);
+    size_t managed = ls(ob, managed_off);
+    if (parent == nullptr)
+    {
+        parent = std::pmr::get_default_resource();
     }
-    
-    std::memcpy(_trusted_memory, other._trusted_memory, allocator_metadata_size);
-    get_mutex_ptr(_trusted_memory)->~mutex();
-    new (get_mutex_ptr(_trusted_memory)) std::mutex();
-    *get_rb_root_ptr(_trusted_memory) = nullptr;
-    
-    char* other_end = reinterpret_cast<char*>(other._trusted_memory) + space_size;
-    char* other_metadata_end = reinterpret_cast<char*>(other._trusted_memory) + allocator_metadata_size;
-    char* other_blocks_start = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(other_metadata_end) + ALIGNMENT - 1) & ~(ALIGNMENT - 1));
-    
-    void* curr = other_blocks_start;
-    void* prev_copy = nullptr;
-    
-    while (curr < other_end) {
-        size_t size = get_block_size(curr);
-        size_t offset = get_header_offset(is_occupied(curr));
-        size_t total_block_size = offset + size;
-        total_block_size = (total_block_size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-        
-        ptrdiff_t diff = reinterpret_cast<char*>(_trusted_memory) - reinterpret_cast<char*>(other._trusted_memory);
-        void* copy_block = reinterpret_cast<char*>(curr) + diff;
-        
-        size_t header_size = is_occupied(curr) ? 
-            occupied_block_metadata_size : free_block_metadata_size;
-        std::memcpy(copy_block, curr, header_size);
-        
-        *get_block_prev_ptr(copy_block) = prev_copy;
-        
-        if (is_occupied(copy_block)) {
-            void* next = reinterpret_cast<char*>(curr) + total_block_size;
-            if (next < other_end) {
-                *get_block_next_ptr(copy_block) = reinterpret_cast<char*>(next) + diff;
-            } else {
-                *get_block_next_ptr(copy_block) = nullptr;
-            }
-        }
-        
-        if (!is_occupied(copy_block)) {
-            *get_block_parent_ptr(copy_block) = nullptr;
-            *get_block_left_ptr(copy_block) = nullptr;
-            *get_block_right_ptr(copy_block) = nullptr;
-            rb_insert(_trusted_memory, copy_block);
-        }
-        
-        prev_copy = copy_block;
-        curr = reinterpret_cast<char*>(curr) + total_block_size;
-    }
+    _trusted_memory = parent->allocate(allocator_metadata_size + free_block_metadata_size + managed);
+    char *base = reinterpret_cast<char*>(_trusted_memory);
+    sp(base, parent_off, parent);
+    std::memcpy(base + mode_off, &mode, sizeof(mode));
+    ss(base, managed_off, managed);
+    new (base + mutex_off) std::mutex();
+
+    char *first = base + allocator_metadata_size;
+    mark_free(first, managed, nullptr);
+    set_color(first, c_black);
+    set_root(base, first);
 }
 
 allocator_red_black_tree &allocator_red_black_tree::operator=(const allocator_red_black_tree &other)
 {
-    if (this != &other) {
-        this->~allocator_red_black_tree();
-        new (this) allocator_red_black_tree(other);
+    if (this == &other)
+    {
+        return *this;
     }
+    allocator_red_black_tree tmp(other);
+    *this = std::move(tmp);
     return *this;
 }
 
 bool allocator_red_black_tree::do_is_equal(const std::pmr::memory_resource &other) const noexcept
 {
-    return this == &other;
+    return dynamic_cast<const allocator_red_black_tree*>(&other) != nullptr;
 }
 
 [[nodiscard]] void *allocator_red_black_tree::do_allocate_sm(size_t size)
 {
-    std::lock_guard<std::mutex> lock(*get_mutex_ptr(_trusted_memory));
-    
-    // Выравниваем запрошенный размер
-    size_t aligned_size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-    size_t mode = *get_fit_mode_ptr(_trusted_memory);
-    void* block = rb_find_fit(_trusted_memory, aligned_size, mode);
-    
-    if (!block) {
+    if (size == 0)
+    {
+        size = 1;
+    }
+    char *base = reinterpret_cast<char*>(_trusted_memory);
+    auto *mtx = reinterpret_cast<std::mutex*>(base + mutex_off);
+    std::lock_guard<std::mutex> lock(*mtx);
+
+    char *chosen = nullptr;
+    auto mode = *reinterpret_cast<allocator_with_fit_mode::fit_mode*>(base + mode_off);
+
+    std::vector<char*> st;
+    char *cur = root(base);
+    while (cur != nullptr || !st.empty())
+    {
+        while (cur != nullptr)
+        {
+            st.push_back(cur);
+            cur = reinterpret_cast<char*>(lp(cur, s1_off));
+        }
+        cur = st.back();
+        st.pop_back();
+
+        size_t cs = free_sz(cur);
+        if (cs >= size)
+        {
+            if (chosen == nullptr)
+            {
+                chosen = cur;
+                if (mode == allocator_with_fit_mode::fit_mode::first_fit)
+                {
+                    break;
+                }
+            }
+            else if (mode == allocator_with_fit_mode::fit_mode::the_best_fit)
+            {
+                if (cs < free_sz(chosen))
+                {
+                    chosen = cur;
+                }
+            }
+            else if (mode == allocator_with_fit_mode::fit_mode::the_worst_fit)
+            {
+                if (cs > free_sz(chosen))
+                {
+                    chosen = cur;
+                }
+            }
+        }
+
+        cur = reinterpret_cast<char*>(lp(cur, s2_off));
+    }
+
+    if (chosen == nullptr)
+    {
         throw std::bad_alloc();
     }
-    
-    rb_delete(_trusted_memory, block);
-    size_t block_size = get_block_size(block);
-    size_t header_offset = get_header_offset(false); // Был свободным
-    
-    // Проверяем, можно ли разделить блок
-    size_t min_remainder = get_header_offset(false) + ALIGNMENT;
-    if (block_size >= aligned_size + min_remainder) {
-        // Разделяем блок
-        set_block_size(block, aligned_size);
-        
-        char* remainder = reinterpret_cast<char*>(block) + header_offset + aligned_size;
-        // Выравниваем начало остатка
-        remainder = reinterpret_cast<char*>(
-            (reinterpret_cast<uintptr_t>(remainder) + ALIGNMENT - 1) & ~(ALIGNMENT - 1));
-        
-        char* original_end = reinterpret_cast<char*>(block) + header_offset + block_size;
-        size_t remainder_size = original_end - remainder - get_header_offset(false);
-        
-        if (remainder_size >= ALIGNMENT) {
-            set_occupied(remainder, false);
-            set_color_byte(remainder, 1); // BLACK
-            set_block_size(remainder, remainder_size);
-            *get_block_prev_ptr(remainder) = block;
-            
-            void* end = reinterpret_cast<char*>(_trusted_memory) + *get_total_size_ptr(_trusted_memory);
-            void* next = get_next_block(remainder, end);
-            if (next) {
-                *get_block_prev_ptr(next) = remainder;
+
+    char *prev = reinterpret_cast<char*>(occ(chosen) ? lp(chosen, s2_off) : lp(chosen, s4_off));
+    char *next = next_blk(chosen);
+    size_t fs = free_sz(chosen);
+
+    rb_delete(base, chosen);
+
+    size_t remaining = fs >= size ? (fs - size) : 0;
+    if (remaining >= free_block_metadata_size + 1)
+    {
+        char *nf = chosen + free_md + size;
+        size_t nf_payload = remaining - free_md;
+        mark_free(nf, nf_payload, chosen);
+        if (next < base + allocator_metadata_size + free_md + ls(base, managed_off))
+        {
+            if (occ(next))
+            {
+                sp(next, s2_off, nf);
             }
-            
-            *get_block_parent_ptr(remainder) = nullptr;
-            *get_block_left_ptr(remainder) = nullptr;
-            *get_block_right_ptr(remainder) = nullptr;
-            rb_insert(_trusted_memory, remainder);
+            else
+            {
+                sp(next, s4_off, nf);
+            }
         }
+        rb_insert(base, nf);
+        mark_occ(chosen, _trusted_memory, size + md_delta, prev);
     }
-    
-    // Помечаем как занятый
-    set_occupied(block, true);
-    void* end = reinterpret_cast<char*>(_trusted_memory) + *get_total_size_ptr(_trusted_memory);
-    void* next = get_next_block(block, end);
-    *get_block_next_ptr(block) = next;
-    
-    return get_user_ptr(block);
+    else
+    {
+        if (next < base + allocator_metadata_size + free_md + ls(base, managed_off))
+        {
+            if (occ(next))
+            {
+                sp(next, s2_off, chosen);
+            }
+            else
+            {
+                sp(next, s4_off, chosen);
+            }
+        }
+        mark_occ(chosen, _trusted_memory, fs + md_delta, prev);
+    }
+
+    return chosen + occ_md;
 }
 
 void allocator_red_black_tree::do_deallocate_sm(void *at)
 {
-    if (!at) return;
-    
-    std::lock_guard<std::mutex> lock(*get_mutex_ptr(_trusted_memory));
-    
-    char* start = reinterpret_cast<char*>(_trusted_memory) + allocator_metadata_size;
-    char* end = reinterpret_cast<char*>(_trusted_memory) + *get_total_size_ptr(_trusted_memory);
-    char* ptr = reinterpret_cast<char*>(at);
-    
-    if (ptr < start || ptr >= end) {
-        throw std::runtime_error("Pointer out of range");
+    if (at == nullptr)
+    {
+        return;
     }
-    
-    void* block = get_block_ptr_from_user(at);
-    
-    if (reinterpret_cast<char*>(block) < start) {
-        throw std::runtime_error("Invalid block pointer");
+    char *base = reinterpret_cast<char*>(_trusted_memory);
+    auto *mtx = reinterpret_cast<std::mutex*>(base + mutex_off);
+    std::lock_guard<std::mutex> lock(*mtx);
+
+    char *begin = base + allocator_metadata_size;
+    char *end = begin + free_md + ls(base, managed_off);
+    char *payload = reinterpret_cast<char*>(at);
+
+    if (payload < begin + occ_md || payload >= end)
+    {
+        throw std::invalid_argument("");
     }
-    
-    if (!is_occupied(block)) {
-        throw std::runtime_error("Block is not occupied");
+
+    char *block = payload - occ_md;
+    if (!occ(block))
+    {
+        throw std::invalid_argument("");
     }
-    
-    // Помечаем как свободный
-    set_occupied(block, false);
-    set_color_byte(block, 1); // BLACK
-    
-    // Объединяем со следующим
-    void* next = *get_block_next_ptr(block);
-    if (next && !is_occupied(next)) {
-        rb_delete(_trusted_memory, next);
-        size_t offset1 = get_header_offset(false);
-        size_t offset2 = get_header_offset(false);
-        size_t fp1 = offset1 + get_block_size(block);
-        size_t fp2 = offset2 + get_block_size(next);
-        fp1 = (fp1 + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-        fp2 = (fp2 + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-        set_block_size(block, fp1 + fp2 - offset1);
-        
-        void* next_next = get_next_block(next, end);
-        if (next_next) {
-            *get_block_prev_ptr(next_next) = block;
+    if (lp(block, s0_off) != _trusted_memory)
+    {
+        throw std::invalid_argument("");
+    }
+
+    size_t cur = occ_sz(block);
+    if (cur < md_delta)
+    {
+        throw std::invalid_argument("");
+    }
+    cur -= md_delta;
+    char *prev = reinterpret_cast<char*>(lp(block, s2_off));
+    mark_free(block, cur, prev);
+
+    char *next = next_blk(block);
+    if (next < end && !occ(next))
+    {
+        rb_delete(base, next);
+        cur += free_md + free_sz(next);
+        ss(block, s3_off, cur);
+        char *nn = next_blk(next);
+        if (nn < end)
+        {
+            if (occ(nn))
+            {
+                sp(nn, s2_off, block);
+            }
+            else
+            {
+                sp(nn, s4_off, block);
+            }
         }
     }
-    
-    // Объединяем с предыдущим
-    void* prev = *get_block_prev_ptr(block);
-    if (prev && !is_occupied(prev)) {
-        rb_delete(_trusted_memory, prev);
-        size_t offset1 = get_header_offset(false);
-        size_t offset2 = get_header_offset(false);
-        size_t fp1 = offset1 + get_block_size(prev);
-        size_t fp2 = offset2 + get_block_size(block);
-        fp1 = (fp1 + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-        fp2 = (fp2 + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-        set_block_size(prev, fp1 + fp2 - offset1);
-        
-        void* next_next = get_next_block(block, end);
-        if (next_next) {
-            *get_block_prev_ptr(next_next) = prev;
+
+    if (prev != nullptr && !occ(prev))
+    {
+        rb_delete(base, prev);
+        size_t merged = free_sz(prev) + free_md + free_sz(block);
+        ss(prev, s3_off, merged);
+        char *after = next_blk(prev);
+        if (after < end)
+        {
+            if (occ(after))
+            {
+                sp(after, s2_off, prev);
+            }
+            else
+            {
+                sp(after, s4_off, prev);
+            }
         }
         block = prev;
     }
-    
-    // Вставляем в дерево
-    *get_block_parent_ptr(block) = nullptr;
-    *get_block_left_ptr(block) = nullptr;
-    *get_block_right_ptr(block) = nullptr;
-    rb_insert(_trusted_memory, block);
+
+    rb_insert(base, block);
 }
 
 void allocator_red_black_tree::set_fit_mode(allocator_with_fit_mode::fit_mode mode)
 {
-    std::lock_guard<std::mutex> lock(*get_mutex_ptr(_trusted_memory));
-    *get_fit_mode_ptr(_trusted_memory) = static_cast<size_t>(mode);
+    char *base = reinterpret_cast<char*>(_trusted_memory);
+    auto *mtx = reinterpret_cast<std::mutex*>(base + mutex_off);
+    std::lock_guard<std::mutex> lock(*mtx);
+    *reinterpret_cast<allocator_with_fit_mode::fit_mode*>(base + mode_off) = mode;
 }
 
 std::vector<allocator_test_utils::block_info> allocator_red_black_tree::get_blocks_info() const
 {
-    std::lock_guard<std::mutex> lock(*get_mutex_ptr(const_cast<void*>(_trusted_memory)));
+    if (_trusted_memory == nullptr)
+    {
+        return {};
+    }
+    char *base = reinterpret_cast<char*>(_trusted_memory);
+    auto *mtx = reinterpret_cast<std::mutex*>(base + mutex_off);
+    std::lock_guard<std::mutex> lock(*mtx);
     return get_blocks_info_inner();
 }
 
 std::vector<allocator_test_utils::block_info> allocator_red_black_tree::get_blocks_info_inner() const
 {
-    std::vector<allocator_test_utils::block_info> info;
-    
-    char* start = reinterpret_cast<char*>(_trusted_memory) + allocator_metadata_size;
-    char* end = reinterpret_cast<char*>(_trusted_memory) + *get_total_size_ptr(_trusted_memory);
-    
-    char* blocks_start = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(start) + ALIGNMENT - 1) & ~(ALIGNMENT - 1));
-    
-    void* curr = blocks_start;
-    while (curr < end) {
-        allocator_test_utils::block_info bi;
-        bi.is_block_occupied = is_occupied(curr);
-        bi.block_size = get_block_size(curr);
-        info.push_back(bi);
-        
-        size_t offset = get_header_offset(bi.is_block_occupied);
-        size_t total = offset + bi.block_size;
-        total = (total + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-        curr = reinterpret_cast<char*>(curr) + total;
+    std::vector<allocator_test_utils::block_info> out;
+    if (_trusted_memory == nullptr)
+    {
+        return out;
     }
-    
-    return info;
+    char *base = reinterpret_cast<char*>(_trusted_memory);
+    char *b = base + allocator_metadata_size;
+    char *end = b + free_md + ls(base, managed_off);
+    while (b < end)
+    {
+        out.push_back({user_sz(b), occ(b)});
+        b = next_blk(b);
+    }
+    return out;
 }
 
 allocator_red_black_tree::rb_iterator allocator_red_black_tree::begin() const noexcept
 {
-    char* start = reinterpret_cast<char*>(_trusted_memory) + allocator_metadata_size;
-    char* blocks_start = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(start) + ALIGNMENT - 1) & ~(ALIGNMENT - 1));
-    return rb_iterator(blocks_start);
+    if (_trusted_memory == nullptr)
+    {
+        return rb_iterator();
+    }
+    return rb_iterator(_trusted_memory);
 }
 
 allocator_red_black_tree::rb_iterator allocator_red_black_tree::end() const noexcept
 {
-    char* end = reinterpret_cast<char*>(_trusted_memory) + *get_total_size_ptr(_trusted_memory);
-    return rb_iterator(end);
+    return rb_iterator();
 }
-
-// ============================================================================
-// Реализация rb_iterator
-// ============================================================================
-allocator_red_black_tree::rb_iterator::rb_iterator() : _block_ptr(nullptr), _trusted(nullptr) {}
-
-allocator_red_black_tree::rb_iterator::rb_iterator(void* trusted) : _block_ptr(trusted), _trusted(trusted) {}
 
 bool allocator_red_black_tree::rb_iterator::operator==(const allocator_red_black_tree::rb_iterator &other) const noexcept
 {
@@ -840,38 +872,60 @@ bool allocator_red_black_tree::rb_iterator::operator!=(const allocator_red_black
 
 allocator_red_black_tree::rb_iterator &allocator_red_black_tree::rb_iterator::operator++() & noexcept
 {
-    if (!_block_ptr) return *this;
-    
-    bool occ = is_occupied(_block_ptr);
-    size_t offset = get_header_offset(occ);
-    size_t size = get_block_size(_block_ptr);
-    size_t total = offset + size;
-    total = (total + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-    
-    _block_ptr = reinterpret_cast<char*>(_block_ptr) + total;
+    if (_block_ptr == nullptr || _trusted == nullptr)
+    {
+        return *this;
+    }
+    char *base = reinterpret_cast<char*>(_trusted);
+    char *end = base + allocator_metadata_size + free_md + ls(base, managed_off);
+    char *next = reinterpret_cast<char*>(_block_ptr) + free_md + blk_sz(reinterpret_cast<char*>(_block_ptr));
+    _block_ptr = (next >= end) ? nullptr : next;
     return *this;
 }
 
 allocator_red_black_tree::rb_iterator allocator_red_black_tree::rb_iterator::operator++(int n)
 {
-    rb_iterator tmp = *this;
+    (void)n;
+    rb_iterator tmp(*this);
     ++(*this);
     return tmp;
 }
 
 size_t allocator_red_black_tree::rb_iterator::size() const noexcept
 {
-    if (!_block_ptr) return 0;
-    return get_block_size(_block_ptr);
+    if (_block_ptr == nullptr)
+    {
+        return 0;
+    }
+    return user_sz(reinterpret_cast<char*>(_block_ptr));
 }
 
 void *allocator_red_black_tree::rb_iterator::operator*() const noexcept
 {
-    return get_user_ptr(_block_ptr);
+    if (_block_ptr == nullptr)
+    {
+        return nullptr;
+    }
+    return occ(reinterpret_cast<char*>(_block_ptr)) ? reinterpret_cast<char*>(_block_ptr) + occ_md : reinterpret_cast<char*>(_block_ptr) + free_md;
+}
+
+allocator_red_black_tree::rb_iterator::rb_iterator()
+{
+    _block_ptr = nullptr;
+    _trusted = nullptr;
+}
+
+allocator_red_black_tree::rb_iterator::rb_iterator(void *trusted)
+{
+    _trusted = trusted;
+    _block_ptr = (trusted == nullptr) ? nullptr : reinterpret_cast<char*>(trusted) + allocator_metadata_size;
 }
 
 bool allocator_red_black_tree::rb_iterator::occupied() const noexcept
 {
-    if (!_block_ptr) return false;
-    return is_occupied(_block_ptr);
+    if (_block_ptr == nullptr)
+    {
+        return false;
+    }
+    return occ(reinterpret_cast<char*>(_block_ptr));
 }

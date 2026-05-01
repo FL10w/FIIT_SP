@@ -4,20 +4,20 @@
 #include <new>
 #include <stdexcept>
 
-constexpr size_t parent_off = 0;
-constexpr size_t mode_off =
+constexpr size_t parent_off = 0;                                                                                                        // Смещение для хранения указателя на родительский аллокатор
+constexpr size_t mode_off =                                                                                                             //Смещение для хранения режима поиска
     ((parent_off + sizeof(std::pmr::memory_resource*) + alignof(allocator_with_fit_mode::fit_mode) - 1) /
      alignof(allocator_with_fit_mode::fit_mode)) *
     alignof(allocator_with_fit_mode::fit_mode);
-constexpr size_t managed_off =
+constexpr size_t managed_off =                                                                                                          // Смещение для хранения размера управляемой области памяти
     ((mode_off + sizeof(allocator_with_fit_mode::fit_mode) + alignof(size_t) - 1) / alignof(size_t)) *
     alignof(size_t);
-constexpr size_t mutex_off =
+constexpr size_t mutex_off =                                                                                                            // Смещение для хранения мьютекса
     ((managed_off + sizeof(size_t) + alignof(std::mutex) - 1) / alignof(std::mutex)) * alignof(std::mutex);
-constexpr size_t first_occ_off =
+constexpr size_t first_occ_off =                                                                                                        // Смещение для хранения указателя на первый занятый блок в двусвязном списке
     ((mutex_off + sizeof(std::mutex) + alignof(void*) - 1) / alignof(void*)) * alignof(void*);
-constexpr size_t kAllocatorMetadataSize = first_occ_off + sizeof(void*);
-constexpr size_t kOccupiedBlockMetadataSize = sizeof(size_t) + sizeof(void*) + sizeof(void*) + sizeof(void*);
+constexpr size_t kAllocatorMetadataSize = first_occ_off + sizeof(void*);                                                                // Общий размер всех метаданных аллокатора
+constexpr size_t kOccupiedBlockMetadataSize = sizeof(size_t) + sizeof(void*) + sizeof(void*) + sizeof(void*);                           //Размер заголовка каждого занятого блока
 
 allocator_boundary_tags::~allocator_boundary_tags()
 {
@@ -115,12 +115,12 @@ allocator_boundary_tags::allocator_boundary_tags(
 {
     if (parent_allocator == nullptr)
     {
-        parent_allocator = std::pmr::get_default_resource();
+        parent_allocator = std::pmr::get_default_resource();                                                                          // возвращает указатель на ресурс памяти по умолчанию
     }
     const size_t total_size = kAllocatorMetadataSize + space_size;
-    _trusted_memory = parent_allocator->allocate(total_size, alignof(std::max_align_t));
-    char* base = reinterpret_cast<char*>(_trusted_memory);
-    *reinterpret_cast<std::pmr::memory_resource**>(base + parent_off) = parent_allocator;
+    _trusted_memory = parent_allocator->allocate(total_size, alignof(std::max_align_t));                                              // для вызова метода у указателя используется ->
+    char* base = reinterpret_cast<char*>(_trusted_memory);                                                                            // Память будет выровнена так, что любое поле аллокатора гарантированно окажется корректно выровненным
+    *reinterpret_cast<std::pmr::memory_resource**>(base + parent_off) = parent_allocator;                                               
     *reinterpret_cast<allocator_with_fit_mode::fit_mode*>(base + mode_off) = allocate_fit_mode;
     *reinterpret_cast<size_t*>(base + managed_off) = space_size;
     new (base + mutex_off) std::mutex();
@@ -154,7 +154,7 @@ allocator_boundary_tags::allocator_boundary_tags(
         while (cur != nullptr)
         {
             char* cur_start = reinterpret_cast<char*>(cur);
-            const size_t gap = static_cast<size_t>(cur_start - cursor);
+            const size_t gap = static_cast<size_t>(cur_start - cursor);                                                                                                  //   Между началом области и первым занятым
             if (gap >= needed)
             {
                 best_start = cursor;
@@ -221,7 +221,7 @@ allocator_boundary_tags::allocator_boundary_tags(
         }
         if (region_end >= cursor)
         {
-            const size_t gap = static_cast<size_t>(region_end - cursor);
+            const size_t gap = static_cast<size_t>(region_end - cursor);                                                                                                        // Между последним занятым и концом области
             if (gap >= needed)
             {
                 if (best_start == nullptr)
@@ -258,10 +258,10 @@ allocator_boundary_tags::allocator_boundary_tags(
     {
         payload_size = best_gap - kOccupiedBlockMetadataSize;
     }
-    *reinterpret_cast<size_t*>(reinterpret_cast<char*>(block)) = payload_size;
-    *reinterpret_cast<void**>(reinterpret_cast<char*>(block) + sizeof(size_t)) = best_prev;
-    *reinterpret_cast<void**>(reinterpret_cast<char*>(block) + sizeof(size_t) + sizeof(void*)) = best_next;
-    *reinterpret_cast<void**>(reinterpret_cast<char*>(block) + sizeof(size_t) + sizeof(void*) * 2) = _trusted_memory;
+    *reinterpret_cast<size_t*>(reinterpret_cast<char*>(block)) = payload_size;                                                                              // размер пользовательских данных
+    *reinterpret_cast<void**>(reinterpret_cast<char*>(block) + sizeof(size_t)) = best_prev;                                                                 // указатель на предыдущий занятый блок
+    *reinterpret_cast<void**>(reinterpret_cast<char*>(block) + sizeof(size_t) + sizeof(void*)) = best_next;                                                 // указатель на следующий занятый блок
+    *reinterpret_cast<void**>(reinterpret_cast<char*>(block) + sizeof(size_t) + sizeof(void*) * 2) = _trusted_memory;                                       // указатель на сам аллокатор
     if (best_prev != nullptr)
     {
         *reinterpret_cast<void**>(reinterpret_cast<char*>(best_prev) + sizeof(size_t) + sizeof(void*)) = block;
@@ -460,7 +460,7 @@ allocator_boundary_tags::boundary_iterator &allocator_boundary_tags::boundary_it
     return *this;
 }
 
-allocator_boundary_tags::boundary_iterator &allocator_boundary_tags::boundary_iterator::operator--() & noexcept
+allocator_boundary_tags::boundary_iterator &allocator_boundary_tags::boundary_iterator::operator--() & noexcept                                                 // этот метод можно вызывать только у lvalue-объектов
 {
     if (_trusted_memory == nullptr)
     {

@@ -45,8 +45,7 @@ private:
     btree_node* _root;
     size_t _size;
 
-    pp_allocator<value_type> get_allocator() const noexcept;                                                                                     // Возвращает копию аллокатора
-
+    pp_allocator<value_type> get_allocator() const noexcept;                                                                                     // Возвращает копию аллокатора ассоциативном контейнере
     btree_node* create_node();                                                                                                                   // Выделяет память под новый узел через _allocator и возвращает указатель
     void destroy_node(btree_node* node) noexcept;                                                                                                // Освобождает память одного узла
     void clear_node(btree_node* node) noexcept;                                                                                                  // Рекурсивно уничтожает узел и всё его поддерево        
@@ -113,22 +112,22 @@ public:
         friend class btree_const_iterator;
         friend class btree_const_reverse_iterator;
 
-        reference operator*() const noexcept;
-        pointer operator->() const noexcept;
+        reference operator*() const noexcept;                                                                                                                                   // получить ссылку на пару ключ-значение
+        pointer operator->() const noexcept;                                                                                                                                    // Позволяет обращаться к полям пары через ->.
 
-        self& operator++();
-        self operator++(int);
+        self& operator++();                                                                                                                                                     // (Префиксный) Перемещает итератор на следующий по порядку ключей элемент и возвращает ссылку на себя.
+        self operator++(int);                                                                                                                                                   // (Постфиксный) То же самое, но возвращает копию итератора до перемещения (старое значение). Параметр int — фиктивный, просто чтобы отличить от префиксного.
 
-        self& operator--();
-        self operator--(int);
+        self& operator--();                                                                                                                                                     // (Префиксный) Перемещает итератор на предыдущий по порядку ключей элемент.
+        self operator--(int);                                                                                                                                                   // (Постфиксный) Перемещает назад, но возвращает старое значение.
 
-        bool operator==(const self& other) const noexcept;
-        bool operator!=(const self& other) const noexcept;
+        bool operator==(const self& other) const noexcept;                                                                                                                      // Оба "пустые" (стерты, как end()) — тогда они равны друг другу.  Либо оба непустые, находятся в одном и том же узле и на одной позиции.
+        bool operator!=(const self& other) const noexcept;                                                                                                                      // Просто отрицание operator==.
 
-        size_t depth() const noexcept;
-        size_t current_node_keys_count() const noexcept;
-        bool is_terminate_node() const noexcept;
-        size_t index() const noexcept;
+        size_t depth() const noexcept;                                                                                                                                          // Возвращает, на каком уровне дерева находится итератор.
+        size_t current_node_keys_count() const noexcept;                                                                                                                        // Сколько ключей в том узле, где сейчас находится итератор.
+        bool is_terminate_node() const noexcept;                                                                                                                                // Возвращает true, если итератор "пустой" (как end()). Позволяет проверить, валиден ли итератор.
+        size_t index() const noexcept;                                                                                                                                          // Возвращает индекс текущего ключа в массиве _keys узла (начинается с 0).
 
         explicit btree_iterator(const std::stack<std::pair<btree_node**, size_t>>& path = std::stack<std::pair<btree_node**, size_t>>(), size_t index = 0);
 
@@ -433,11 +432,23 @@ bool B_tree<tkey, tvalue, compare, t>::is_leaf(const btree_node* node) const noe
 template<typename tkey, typename tvalue, comparator<tkey> compare, std::size_t t>
 size_t B_tree<tkey, tvalue, compare, t>::find_key_index(const btree_node* node, const tkey& key, bool& found) const
 {
-    size_t i = 0;
-    while (i < node->_keys.size() && compare_keys(node->_keys[i].first, key)) {
-        ++i;
+    size_t left = 0;
+    size_t right = node->_keys.size();
+
+    while (left < right) {
+        size_t mid = left + (right - left) / 2;
+        if (compare_keys(node->_keys[mid].first, key)) {
+            left = mid + 1; // идём вправо
+        } else {
+            right = mid;    // идём влево
+        }
     }
-    found = (i < node->_keys.size() && !compare_keys(key, node->_keys[i].first) && !compare_keys(node->_keys[i].first, key));
+
+    size_t i = left; // Позиция вставки или найденного элемента
+    found = (i < node->_keys.size() &&
+             !compare_keys(key, node->_keys[i].first) &&
+             !compare_keys(node->_keys[i].first, key));
+
     return i;
 }
 
@@ -530,31 +541,31 @@ bool B_tree<tkey, tvalue, compare, t>::erase_internal(btree_node* node, const tk
     bool found = false;
     size_t idx = find_key_index(node, key, found);
     if (found) {
-        if (is_leaf(node)) {
+        if (is_leaf(node)) {  // Случай 1: Удаление из листа
             node->_keys.erase(node->_keys.begin() + static_cast<ptrdiff_t>(idx));
             --_size;
             return true;
         }
         btree_node* left = node->_pointers[idx];
         btree_node* right = node->_pointers[idx + 1];
-        if (left->_keys.size() >= t) {
+        if (left->_keys.size() >= t) { // Случай 2: Удаление из внутреннего узла (замена)
             tree_data_type pred = get_predecessor(node, idx);
             node->_keys[idx] = pred;
             return erase_internal(left, pred.first);
         }
-        if (right->_keys.size() >= t) {
+        if (right->_keys.size() >= t) { // 2.2. Замена преемником (правый ребёнок)
             tree_data_type succ = get_successor(node, idx);
             node->_keys[idx] = succ;
             return erase_internal(right, succ.first);
         }
-        merge_children(node, idx);
+        merge_children(node, idx); // 2.3. Слияние детей (оба на минимуме):
         return erase_internal(left, key);
     }
-    if (is_leaf(node)) {
+    if (is_leaf(node)) { // Случай 3: Ключ не найден, спуск вниз
         return false;
     }
     btree_node* child = node->_pointers[idx];
-    if (child->_keys.size() == minimum_keys_in_node) {
+    if (child->_keys.size() == minimum_keys_in_node) { // 3.2. Заимствование у левого соседа
         if (idx > 0 && node->_pointers[idx - 1]->_keys.size() >= t) {
             btree_node* left = node->_pointers[idx - 1];
             child->_keys.insert(child->_keys.begin(), std::move(node->_keys[idx - 1]));
@@ -564,7 +575,7 @@ bool B_tree<tkey, tvalue, compare, t>::erase_internal(btree_node* node, const tk
                 child->_pointers.insert(child->_pointers.begin(), left->_pointers.back());
                 left->_pointers.pop_back();
             }
-        } else if (idx + 1 < node->_pointers.size() && node->_pointers[idx + 1]->_keys.size() >= t) {
+        } else if (idx + 1 < node->_pointers.size() && node->_pointers[idx + 1]->_keys.size() >= t) { // 3.3. Заимствование у правого соседа:
             btree_node* right = node->_pointers[idx + 1];
             child->_keys.push_back(std::move(node->_keys[idx]));
             node->_keys[idx] = std::move(right->_keys.front());
@@ -573,16 +584,16 @@ bool B_tree<tkey, tvalue, compare, t>::erase_internal(btree_node* node, const tk
                 child->_pointers.push_back(right->_pointers.front());
                 right->_pointers.erase(right->_pointers.begin());
             }
-        } else {
+        } else { // 3.4. Слияние с правым соседом:
             if (idx + 1 < node->_pointers.size()) {
                 merge_children(node, idx);
-            } else {
+            } else { // 3.5. Слияние с левым соседом:
                 merge_children(node, idx - 1);
                 child = node->_pointers[idx - 1];
             }
         }
     }
-    return erase_internal(child, key);
+    return erase_internal(child, key); // 3.6. Рекурсивный спуск:
 }
 
 // region constructors implementation
@@ -755,7 +766,7 @@ B_tree<tkey, tvalue, compare, t>::btree_iterator::btree_iterator(
 
 template<typename tkey, typename tvalue, comparator<tkey> compare, std::size_t t>
 typename B_tree<tkey, tvalue, compare, t>::btree_iterator::reference
-B_tree<tkey, tvalue, compare, t>::btree_iterator::operator*() const noexcept
+B_tree<tkey, tvalue, compare, t>::btree_iterator::operator*() const noexcept                                       
 {
     btree_node* node = *(_path.top().first);
     return *reinterpret_cast<value_type*>(&node->_keys[_index]);
